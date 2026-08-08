@@ -1,0 +1,12 @@
+{
+  "name": "pmdb-nuvio-addon",
+  "version": "1.0.0",
+  "description": "PublicMetaDB Continue Watching addon for Nuvio",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
