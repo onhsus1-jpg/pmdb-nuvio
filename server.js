@@ -8,24 +8,15 @@ const PMDB_API_KEY = process.env.PMDB_API_KEY;
 const PMDB_BASE = "https://publicmetadb.com";
 
 // ----------------------------------------------------
-// Basic configuration
-// ----------------------------------------------------
-
-if (!PMDB_API_KEY) {
-    console.warn("WARNING: PMDB_API_KEY is not configured.");
-}
-
-// ----------------------------------------------------
 // Manifest
 // ----------------------------------------------------
 
 app.get("/manifest.json", (req, res) => {
     res.json({
         id: "com.pmdb.nuvio.continuewatching",
-        version: "1.0.0",
+        version: "1.0.1",
         name: "PMDB Continue Watching",
         description: "Continue Watching from PublicMetaDB",
-        logo: "https://publicmetadb.com/favicon.ico",
 
         resources: [
             "catalog",
@@ -53,7 +44,7 @@ app.get("/manifest.json", (req, res) => {
 });
 
 // ----------------------------------------------------
-// PMDB API helper
+// Get PMDB resume data
 // ----------------------------------------------------
 
 async function getPMDBResume() {
@@ -65,6 +56,8 @@ async function getPMDBResume() {
     const url =
         `${PMDB_BASE}/api/external/resume?page=1&perPage=100`;
 
+    console.log("Requesting PMDB:", url);
+
     const response = await fetch(url, {
         method: "GET",
         headers: {
@@ -73,48 +66,220 @@ async function getPMDBResume() {
         }
     });
 
+    const text = await response.text();
+
+    console.log("PMDB HTTP status:", response.status);
+
     if (!response.ok) {
-        const text = await response.text();
+        console.error("PMDB error:", text.substring(0, 1000));
 
         throw new Error(
-            `PMDB returned ${response.status}: ${text}`
+            `PMDB returned HTTP ${response.status}`
         );
     }
 
-    return await response.json();
+    let data;
+
+    try {
+        data = JSON.parse(text);
+    } catch (error) {
+        console.error("PMDB did not return JSON");
+        console.error(text.substring(0, 1000));
+
+        throw new Error("PMDB returned invalid JSON");
+    }
+
+    return data;
 }
 
 // ----------------------------------------------------
-// Convert PMDB item → Stremio item
+// Extract rows
+// ----------------------------------------------------
+
+function getRows(data) {
+
+    if (Array.isArray(data)) {
+        return data;
+    }
+
+    if (!data || typeof data !== "object") {
+        return [];
+    }
+
+    for (const key of ["items", "results", "data"]) {
+
+        if (Array.isArray(data[key])) {
+            return data[key];
+        }
+    }
+
+    return [];
+}
+
+// ----------------------------------------------------
+// Safe diagnostic information
+// Does NOT expose your actual watch history.
+// ----------------------------------------------------
+
+app.get("/debug/pmdb", async (req, res) => {
+
+    try {
+
+        const data = await getPMDBResume();
+        const rows = getRows(data);
+
+        const first =
+            rows.length > 0 &&
+            rows[0] &&
+            typeof rows[0] === "object"
+                ? rows[0]
+                : null;
+
+        const firstRowKeys =
+            first
+                ? Object.keys(first)
+                : [];
+
+        const topLevelKeys =
+            data &&
+            typeof data === "object" &&
+            !Array.isArray(data)
+                ? Object.keys(data)
+                : [];
+
+        res.json({
+            success: true,
+
+            pmdbResponseType:
+                Array.isArray(data)
+                    ? "array"
+                    : typeof data,
+
+            topLevelKeys,
+
+            rowCount: rows.length,
+
+            firstRowKeys,
+
+            detectedFields: {
+                mediaType: first
+                    ? (
+                        first.media_type ??
+                        first.mediaType ??
+                        first.type ??
+                        null
+                    )
+                    : null,
+
+                tmdb: first
+                    ? (
+                        first.tmdb_id ??
+                        first.tmdbId ??
+                        first.tmdb ??
+                        first.ids?.tmdb ??
+                        first.show_ids?.tmdb ??
+                        null
+                    )
+                    : null,
+
+                season: first
+                    ? (
+                        first.season ??
+                        first.season_number ??
+                        first.seasonNumber ??
+                        null
+                    )
+                    : null,
+
+                episode: first
+                    ? (
+                        first.episode ??
+                        first.episode_number ??
+                        first.episodeNumber ??
+                        null
+                    )
+                    : null,
+
+                progress: first
+                    ? (
+                        first.progress_ms ??
+                        first.progressMs ??
+                        first.position_ms ??
+                        first.positionMs ??
+                        first.viewOffset ??
+                        first.progress_percent ??
+                        first.progressPercent ??
+                        first.percent ??
+                        first.progress ??
+                        null
+                    )
+                    : null,
+
+                duration: first
+                    ? (
+                        first.duration_ms ??
+                        first.durationMs ??
+                        first.runtime_ms ??
+                        first.runtimeMs ??
+                        first.duration ??
+                        first.runtime ??
+                        null
+                    )
+                    : null
+            }
+        });
+
+    } catch (error) {
+
+        console.error(error);
+
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
+// ----------------------------------------------------
+// Convert PMDB item
 // ----------------------------------------------------
 
 function convertItem(item) {
 
+    if (!item || typeof item !== "object") {
+        return null;
+    }
+
     const mediaType =
-        item.media_type ||
-        item.mediaType ||
-        item.type;
+        item.media_type ??
+        item.mediaType ??
+        item.type ??
+        "";
 
-    const ids =
-        item.show_ids ||
-        item.showIds ||
-        item.ids ||
-        {};
+    const normalizedType =
+        String(mediaType).toLowerCase();
 
+    // PMDB can store TMDB IDs in different structures.
     const tmdb =
-        ids.tmdb ||
-        item.tmdb_id ||
+        item.ids?.tmdb ??
+        item.show_ids?.tmdb ??
+        item.tmdb ??
+        item.tmdb_id ??
         item.tmdbId;
 
     if (!tmdb) {
         return null;
     }
 
-    // TV episode
+    // ------------------------------------------------
+    // TV
+    // ------------------------------------------------
+
     if (
-        mediaType === "tv" ||
-        mediaType === "series" ||
-        mediaType === "episode"
+        normalizedType === "tv" ||
+        normalizedType === "show" ||
+        normalizedType === "series" ||
+        normalizedType === "episode"
     ) {
 
         const season =
@@ -134,49 +299,72 @@ function convertItem(item) {
             return null;
         }
 
+        const title =
+            item.series_title ??
+            item.show_title ??
+            item.name ??
+            item.title ??
+            "Unknown";
+
         return {
-            id: `tmdb:${tmdb}:${season}:${episode}`,
+            id: `tmdb:${tmdb}`,
             type: "series",
-            name: item.title || item.name || "Unknown",
+            name: title,
+
+            // Keep this information for later.
             season: Number(season),
-            episode: Number(episode)
+            episode: Number(episode),
+
+            behaviorHints: {
+                defaultVideoId:
+                    `${Number(season)}:${Number(episode)}`
+            }
         };
     }
 
-    // Movie
+    // ------------------------------------------------
+    // MOVIE
+    // ------------------------------------------------
+
     return {
         id: `tmdb:${tmdb}`,
         type: "movie",
-        name: item.title || item.name || "Unknown"
+        name:
+            item.title ??
+            item.name ??
+            "Unknown"
     };
 }
 
 // ----------------------------------------------------
-// Get all PMDB resume items
+// Get usable Continue Watching items
 // ----------------------------------------------------
 
 async function getContinueWatching() {
 
     const data = await getPMDBResume();
 
-    // PMDB/CrossWatch implementations can return
-    // different wrapper structures, so support them.
+    const rows = getRows(data);
 
-    let items = [];
+    console.log("PMDB rows received:", rows.length);
 
-    if (Array.isArray(data)) {
-        items = data;
-    } else if (Array.isArray(data.items)) {
-        items = data.items;
-    } else if (Array.isArray(data.results)) {
-        items = data.results;
-    } else if (Array.isArray(data.data)) {
-        items = data.data;
+    const converted = [];
+
+    for (const row of rows) {
+
+        const item = convertItem(row);
+
+        if (item) {
+            converted.push(item);
+        }
     }
 
-    return items
-        .map(convertItem)
-        .filter(Boolean);
+    console.log(
+        "PMDB items converted:",
+        converted.length
+    );
+
+    return converted;
 }
 
 // ----------------------------------------------------
@@ -189,11 +377,13 @@ app.get(
 
         try {
 
-            const items = await getContinueWatching();
+            const items =
+                await getContinueWatching();
 
-            const movies = items.filter(
-                item => item.type === "movie"
-            );
+            const movies =
+                items.filter(
+                    item => item.type === "movie"
+                );
 
             res.json({
                 metas: movies
@@ -220,11 +410,13 @@ app.get(
 
         try {
 
-            const items = await getContinueWatching();
+            const items =
+                await getContinueWatching();
 
-            const series = items.filter(
-                item => item.type === "series"
-            );
+            const series =
+                items.filter(
+                    item => item.type === "series"
+                );
 
             res.json({
                 metas: series
@@ -254,7 +446,7 @@ app.get("/", (req, res) => {
 });
 
 // ----------------------------------------------------
-// Start server
+// Start
 // ----------------------------------------------------
 
 app.listen(PORT, () => {
